@@ -30,7 +30,7 @@ struct ListWindowsRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetPaneContentsRequest {
     #[schemars(
-        description = "Target in tmux format. Can be:\n- \"session:window\" to get all panes in a window\n- \"session:window.pane\" to get a specific pane\nExamples: \"API:5\", \"API:5.1\"\nSession is optional — if omitted from the target (e.g., \"5\" or \"5.1\"), the current session is used.\nIf target is omitted entirely, defaults to the current window."
+        description = "Target in tmux format. Can be:\n- \"session:window\" to get all panes in a window\n- \"session:window.pane\" to get a specific pane\nExamples: \"API:5\", \"API:5.1\"\nSession is optional — if omitted from the target (e.g., \"5\" or \"5.1\"), the current session is used.\nUse \".pane\" (e.g., \".2\") to target a specific pane in the current window.\nIf target is omitted entirely, defaults to the current window."
     )]
     target: Option<String>,
 
@@ -185,9 +185,20 @@ impl TmuxMcp {
         let scroll_back = req.scroll_back_lines.unwrap_or(1000);
 
         // Resolve target, defaulting to current window.
-        // If a target is provided without a session prefix (no ':'), prepend the current session.
+        // - ".pane" (e.g. ".2") → pane in the current window
+        // - No ':' (e.g. "1.2" or "3") → prepend current session
+        // - Full target (e.g. "Coder:1.2") → use as-is
         let target = match req.target {
             Some(t) if t.contains(':') => t,
+            Some(t) if t.starts_with('.') => {
+                let Some(pane_id) = &self.current_pane_id else {
+                    return "Target has no session prefix and not running inside tmux".into();
+                };
+                match resolve_pane_id(pane_id, "#{session_name}:#{window_index}").await {
+                    Ok(current_window) => format!("{current_window}{t}"),
+                    Err(e) => return e,
+                }
+            }
             Some(t) => {
                 let Some(pane_id) = &self.current_pane_id else {
                     return "Target has no session prefix and not running inside tmux".into();
