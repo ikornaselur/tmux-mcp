@@ -30,7 +30,7 @@ struct ListWindowsRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetPaneContentsRequest {
     #[schemars(
-        description = "Target in tmux format. Can be:\n- \"session:window\" to get all panes in a window\n- \"session:window.pane\" to get a specific pane\nExamples: \"API:5\", \"API:5.1\"\nIf omitted, defaults to the current window."
+        description = "Target in tmux format. Can be:\n- \"session:window\" to get all panes in a window\n- \"session:window.pane\" to get a specific pane\nExamples: \"API:5\", \"API:5.1\"\nSession is optional — if omitted from the target (e.g., \"5\" or \"5.1\"), the current session is used.\nIf target is omitted entirely, defaults to the current window."
     )]
     target: Option<String>,
 
@@ -115,10 +115,29 @@ impl TmuxMcp {
             None => run_tmux(&["list-windows", "-a", "-F", format]).await,
         };
 
-        match result {
+        let output = match result {
             Ok(output) => output,
-            Err(e) => e,
-        }
+            Err(e) => return e,
+        };
+
+        // Mark the window this MCP server is running in
+        let current = match &self.current_pane_id {
+            Some(pane_id) => resolve_pane_id(pane_id, "#{session_name}:#{window_index}").await.ok(),
+            None => None,
+        };
+
+        output
+            .lines()
+            .map(|line| {
+                let key = line.split('\t').next().unwrap_or("");
+                if current.as_deref() == Some(key) {
+                    format!("{line}\t<-- current")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[tool(
@@ -165,9 +184,19 @@ impl TmuxMcp {
     ) -> String {
         let scroll_back = req.scroll_back_lines.unwrap_or(1000);
 
-        // Resolve target, defaulting to current window
+        // Resolve target, defaulting to current window.
+        // If a target is provided without a session prefix (no ':'), prepend the current session.
         let target = match req.target {
-            Some(t) => t,
+            Some(t) if t.contains(':') => t,
+            Some(t) => {
+                let Some(pane_id) = &self.current_pane_id else {
+                    return "Target has no session prefix and not running inside tmux".into();
+                };
+                match resolve_pane_id(pane_id, "#{session_name}").await {
+                    Ok(session) => format!("{session}:{t}"),
+                    Err(e) => return e,
+                }
+            }
             None => {
                 let Some(pane_id) = &self.current_pane_id else {
                     return "No target specified and not running inside tmux".into();
