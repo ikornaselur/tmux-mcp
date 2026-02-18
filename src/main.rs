@@ -12,6 +12,9 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tracing_subscriber::{self, EnvFilter};
 
+const MAX_NAME_LEN: usize = 20;
+const MAX_CMD_LEN: usize = 16;
+
 #[derive(Debug, Clone)]
 struct TmuxMcp {
     tool_router: ToolRouter<Self>,
@@ -19,12 +22,98 @@ struct TmuxMcp {
     current_pane_id: Option<String>,
 }
 
+// -- Helper types and functions --
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
+}
+
+fn align_columns(rows: &[Vec<String>]) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; col_count];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(i, cell)| {
+                    if i + 1 < row.len() {
+                        format!("{:width$}", cell, width = widths[i])
+                    } else {
+                        cell.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .collect()
+}
+
+struct PaneInfo {
+    pane_index: u32,
+    width: u32,
+    height: u32,
+    current_command: String,
+    is_active: bool,
+    pane_id: String,
+}
+
+async fn fetch_panes(session: &str, window_index: &str) -> Result<Vec<PaneInfo>, String> {
+    let target = format!("{session}:{window_index}");
+    let format =
+        "#{pane_index}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{pane_id}";
+    let output = run_tmux(&["list-panes", "-t", &target, "-F", format]).await?;
+    let mut panes = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        panes.push(PaneInfo {
+            pane_index: fields[0].parse().unwrap_or(0),
+            width: fields[1].parse().unwrap_or(0),
+            height: fields[2].parse().unwrap_or(0),
+            current_command: fields[3].to_string(),
+            is_active: fields[4] == "1",
+            pane_id: fields[5].to_string(),
+        });
+    }
+    Ok(panes)
+}
+
 // -- Tool parameter types --
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListSessionsRequest {
+    #[schemars(
+        description = "When true, show a full tree with sessions, windows, and panes. Defaults to false."
+    )]
+    verbose: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListWindowsRequest {
-    #[schemars(description = "Optional session name to filter by. If omitted, lists windows from all sessions.")]
+    #[schemars(
+        description = "Optional session name to filter by. If omitted, lists windows from all sessions."
+    )]
     session: Option<String>,
+
+    #[schemars(
+        description = "When true, show pane details beneath each window. Defaults to false."
+    )]
+    verbose: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -91,21 +180,156 @@ impl TmuxMcp {
         }
     }
 
-    #[tool(description = "List all tmux sessions with their properties")]
-    async fn list_sessions(&self) -> String {
-        let format = "#{session_name}\t#{session_windows} windows\t#{session_created}\t#{?session_attached,attached,detached}";
-        match run_tmux(&["list-sessions", "-F", format]).await {
-            Ok(output) => output,
-            Err(e) => e,
+    #[tool(
+        description = "List all tmux sessions with their properties. Set verbose=true for a full tree showing sessions, windows, and panes."
+    )]
+    async fn list_sessions(
+        &self,
+        Parameters(req): Parameters<ListSessionsRequest>,
+    ) -> String {
+        let verbose = req.verbose.unwrap_or(false);
+
+        let format =
+            "#{session_name}\t#{session_windows}\t#{?session_attached,attached,detached}";
+        let output = match run_tmux(&["list-sessions", "-F", format]).await {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+
+        struct SessionRow {
+            name: String,
+            window_count: String,
+            state: String,
         }
+
+        let sessions: Vec<SessionRow> = output
+            .lines()
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 3 {
+                    return None;
+                }
+                Some(SessionRow {
+                    name: f[0].to_string(),
+                    window_count: f[1].to_string(),
+                    state: f[2].to_string(),
+                })
+            })
+            .collect();
+
+        if !verbose {
+            let rows: Vec<Vec<String>> = sessions
+                .iter()
+                .map(|s| {
+                    vec![
+                        truncate(&s.name, MAX_NAME_LEN),
+                        format!("({})", s.state),
+                        format!(
+                            "{} window{}",
+                            s.window_count,
+                            if s.window_count == "1" { "" } else { "s" }
+                        ),
+                    ]
+                })
+                .collect();
+            return align_columns(&rows).join("\n");
+        }
+
+        // Verbose: full tree
+        let mut out = String::new();
+        for session in &sessions {
+            let wcount: u32 = session.window_count.parse().unwrap_or(0);
+            out.push_str(&format!(
+                "{} ({})  {} window{}\n",
+                truncate(&session.name, MAX_NAME_LEN),
+                session.state,
+                wcount,
+                if wcount == 1 { "" } else { "s" }
+            ));
+
+            // Fetch windows for this session
+            let win_format = "#{window_index}\t#{window_name}\t#{window_panes}";
+            let wins = match run_tmux(&[
+                "list-windows",
+                "-t",
+                &format!("{}:", session.name),
+                "-F",
+                win_format,
+            ])
+            .await
+            {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+
+            for win_line in wins.lines() {
+                let wf: Vec<&str> = win_line.split('\t').collect();
+                if wf.len() < 3 {
+                    continue;
+                }
+                let win_idx = wf[0];
+                let win_name = wf[1];
+                let pane_count: u32 = wf[2].parse().unwrap_or(0);
+
+                out.push_str(&format!(
+                    "  {}:  {}  {} pane{}\n",
+                    win_idx,
+                    truncate(win_name, MAX_NAME_LEN),
+                    pane_count,
+                    if pane_count == 1 { "" } else { "s" }
+                ));
+
+                // Fetch panes
+                let panes = match fetch_panes(&session.name, win_idx).await {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                let pane_rows: Vec<Vec<String>> = panes
+                    .iter()
+                    .map(|p| {
+                        let mut cols = vec![
+                            format!("    .{}", p.pane_index),
+                            format!("{}x{}", p.width, p.height),
+                            truncate(&p.current_command, MAX_CMD_LEN),
+                        ];
+                        let mut suffix = String::new();
+                        if p.is_active {
+                            suffix.push_str("(active)");
+                        }
+                        if self.current_pane_id.as_deref() == Some(p.pane_id.as_str()) {
+                            if !suffix.is_empty() {
+                                suffix.push_str("  ");
+                            }
+                            suffix.push_str("<-- current");
+                        }
+                        if !suffix.is_empty() {
+                            cols.push(suffix);
+                        }
+                        cols
+                    })
+                    .collect();
+
+                for line in align_columns(&pane_rows) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+        }
+
+        out.trim_end().to_string()
     }
 
-    #[tool(description = "List tmux windows. Optionally filter by session name.")]
+    #[tool(
+        description = "List tmux windows. Optionally filter by session name. Set verbose=true to include pane details beneath each window."
+    )]
     async fn list_windows(
         &self,
         Parameters(req): Parameters<ListWindowsRequest>,
     ) -> String {
-        let format = "#{session_name}:#{window_index}\t#{window_name}\t#{window_panes} panes\t#{?window_active,active,}";
+        let verbose = req.verbose.unwrap_or(false);
+
+        let format = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_panes}\t#{?window_active,active,}";
 
         let result = match &req.session {
             Some(session) => {
@@ -120,24 +344,127 @@ impl TmuxMcp {
             Err(e) => return e,
         };
 
-        // Mark the window this MCP server is running in
-        let current = match &self.current_pane_id {
-            Some(pane_id) => resolve_pane_id(pane_id, "#{session_name}:#{window_index}").await.ok(),
+        // Resolve current window/pane for markers
+        let current_window = match &self.current_pane_id {
+            Some(pane_id) => {
+                resolve_pane_id(pane_id, "#{session_name}:#{window_index}")
+                    .await
+                    .ok()
+            }
             None => None,
         };
 
-        output
+        struct WinRow {
+            session: String,
+            index: String,
+            name: String,
+            pane_count: String,
+            active: String,
+        }
+
+        let windows: Vec<WinRow> = output
             .lines()
-            .map(|line| {
-                let key = line.split('\t').next().unwrap_or("");
-                if current.as_deref() == Some(key) {
-                    format!("{line}\t<-- current")
-                } else {
-                    line.to_string()
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 5 {
+                    return None;
                 }
+                Some(WinRow {
+                    session: f[0].to_string(),
+                    index: f[1].to_string(),
+                    name: f[2].to_string(),
+                    pane_count: f[3].to_string(),
+                    active: f[4].to_string(),
+                })
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect();
+
+        if !verbose {
+            let rows: Vec<Vec<String>> = windows
+                .iter()
+                .map(|w| {
+                    let key = format!("{}:{}", w.session, w.index);
+                    let pcount: u32 = w.pane_count.parse().unwrap_or(0);
+                    let mut cols = vec![
+                        key.clone(),
+                        truncate(&w.name, MAX_NAME_LEN),
+                        format!(
+                            "{} pane{}",
+                            pcount,
+                            if pcount == 1 { "" } else { "s" }
+                        ),
+                    ];
+                    if w.active == "active" {
+                        cols.push("active".to_string());
+                    }
+                    if current_window.as_deref() == Some(&key) {
+                        cols.push("<-- current".to_string());
+                    }
+                    cols
+                })
+                .collect();
+            return align_columns(&rows).join("\n");
+        }
+
+        // Verbose: windows with panes expanded
+        let mut out = String::new();
+        for w in &windows {
+            let key = format!("{}:{}", w.session, w.index);
+            let pcount: u32 = w.pane_count.parse().unwrap_or(0);
+            let is_current_window = current_window.as_deref() == Some(&key);
+
+            out.push_str(&format!(
+                "{}:  {}  {} pane{}",
+                key,
+                truncate(&w.name, MAX_NAME_LEN),
+                pcount,
+                if pcount == 1 { "" } else { "s" }
+            ));
+            if w.active == "active" {
+                out.push_str("  active");
+            }
+            out.push('\n');
+
+            // Fetch panes if this window is accessible
+            let panes = match fetch_panes(&w.session, &w.index).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let pane_rows: Vec<Vec<String>> = panes
+                .iter()
+                .map(|p| {
+                    let mut cols = vec![
+                        format!("  .{}", p.pane_index),
+                        format!("{}x{}", p.width, p.height),
+                        truncate(&p.current_command, MAX_CMD_LEN),
+                    ];
+                    let mut suffix = String::new();
+                    if p.is_active {
+                        suffix.push_str("(active)");
+                    }
+                    if is_current_window
+                        && self.current_pane_id.as_deref() == Some(p.pane_id.as_str())
+                    {
+                        if !suffix.is_empty() {
+                            suffix.push_str("  ");
+                        }
+                        suffix.push_str("<-- current");
+                    }
+                    if !suffix.is_empty() {
+                        cols.push(suffix);
+                    }
+                    cols
+                })
+                .collect();
+
+            for line in align_columns(&pane_rows) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+
+        out.trim_end().to_string()
     }
 
     #[tool(
