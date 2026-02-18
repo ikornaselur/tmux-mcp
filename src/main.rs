@@ -119,7 +119,20 @@ struct ListWindowsRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetPaneContentsRequest {
     #[schemars(
-        description = "Target in tmux format. Can be:\n- \"session:window\" to get all panes in a window\n- \"session:window.pane\" to get a specific pane\nExamples: \"API:5\", \"API:5.1\"\nSession is optional — if omitted from the target (e.g., \"5\" or \"5.1\"), the current session is used.\nUse \".pane\" (e.g., \".2\") to target a specific pane in the current window.\nIf target is omitted entirely, defaults to the current window."
+        description = "Target pane. Formats:\n- \"x\" - pane x in current window\n- \"y.x\" - pane x in window y (current session)\n- \"sess:y.x\" - pane x in window y in session sess\nExamples: \"1\", \"5.1\", \"API:5.1\""
+    )]
+    target: String,
+
+    #[schemars(
+        description = "Number of lines of scrollback history to include. 0 means visible area only. Defaults to 1000."
+    )]
+    scroll_back_lines: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetWindowContentsRequest {
+    #[schemars(
+        description = "Target window. Formats:\n- \"y\" - window y in current session\n- \"sess:y\" - window y in session sess\nExamples: \"5\", \"API:5\"\nIf omitted, defaults to the current window."
     )]
     target: Option<String>,
 
@@ -503,32 +516,60 @@ impl TmuxMcp {
     }
 
     #[tool(
-        description = "Get the contents of a tmux pane or all panes in a window. Supports scrollback history. If target is omitted, defaults to the current window."
+        description = "Get the contents of a specific tmux pane. Supports scrollback history."
     )]
     async fn get_pane_contents(
         &self,
         Parameters(req): Parameters<GetPaneContentsRequest>,
     ) -> String {
         let scroll_back = req.scroll_back_lines.unwrap_or(1000);
+        let t = req.target.trim().to_string();
 
-        // Resolve target, defaulting to current window.
-        // - ".pane" (e.g. ".2") → pane in the current window
-        // - No ':' (e.g. "1.2" or "3") → prepend current session
-        // - Full target (e.g. "Coder:1.2") → use as-is
+        // Resolve target to session:window.pane format.
+        let target = if t.contains(':') {
+            // "sess:y.x" - fully qualified
+            if !t.contains('.') {
+                return format!("Invalid target \"{t}\": expected \"sess:window.pane\" but no pane specifier found. Use get_window_contents to read an entire window.");
+            }
+            t
+        } else if t.contains('.') {
+            // "y.x" - window.pane, prepend current session
+            let Some(pane_id) = &self.current_pane_id else {
+                return "Not running inside tmux".into();
+            };
+            match resolve_pane_id(pane_id, "#{session_name}").await {
+                Ok(session) => format!("{session}:{t}"),
+                Err(e) => return e,
+            }
+        } else {
+            // "x" - bare pane index, prepend current session:window
+            let Some(pane_id) = &self.current_pane_id else {
+                return "Not running inside tmux".into();
+            };
+            match resolve_pane_id(pane_id, "#{session_name}:#{window_index}").await {
+                Ok(current_window) => format!("{current_window}.{t}"),
+                Err(e) => return e,
+            }
+        };
+
+        capture_pane(&target, scroll_back).await
+    }
+
+    #[tool(
+        description = "Get the contents of all panes in a tmux window. Supports scrollback history. If target is omitted, defaults to the current window."
+    )]
+    async fn get_window_contents(
+        &self,
+        Parameters(req): Parameters<GetWindowContentsRequest>,
+    ) -> String {
+        let scroll_back = req.scroll_back_lines.unwrap_or(1000);
+
         let target = match req.target {
             Some(t) if t.contains(':') => t,
-            Some(t) if t.starts_with('.') => {
-                let Some(pane_id) = &self.current_pane_id else {
-                    return "Target has no session prefix and not running inside tmux".into();
-                };
-                match resolve_pane_id(pane_id, "#{session_name}:#{window_index}").await {
-                    Ok(current_window) => format!("{current_window}{t}"),
-                    Err(e) => return e,
-                }
-            }
             Some(t) => {
+                // Bare window index, prepend current session
                 let Some(pane_id) = &self.current_pane_id else {
-                    return "Target has no session prefix and not running inside tmux".into();
+                    return "Not running inside tmux".into();
                 };
                 match resolve_pane_id(pane_id, "#{session_name}").await {
                     Ok(session) => format!("{session}:{t}"),
@@ -546,34 +587,25 @@ impl TmuxMcp {
             }
         };
 
-        // Check if target includes a pane specifier (has a dot)
-        let has_pane = target.contains('.');
+        let pane_format = "#{session_name}:#{window_index}.#{pane_index}\t#{pane_title}\t#{pane_width}x#{pane_height}\t#{?pane_active,active,}";
 
-        if has_pane {
-            // Single pane
-            capture_pane(&target, scroll_back).await
-        } else {
-            // Whole window — list panes then capture each
-            let pane_format = "#{session_name}:#{window_index}.#{pane_index}\t#{pane_title}\t#{pane_width}x#{pane_height}\t#{?pane_active,active,}";
+        let panes = match run_tmux(&["list-panes", "-t", &target, "-F", pane_format]).await {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
 
-            let panes = match run_tmux(&["list-panes", "-t", &target, "-F", pane_format]).await {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
-
-            let mut output = String::new();
-            for line in panes.lines() {
-                let pane_target = line.split('\t').next().unwrap_or("");
-                if pane_target.is_empty() {
-                    continue;
-                }
-
-                output.push_str(&format!("=== Pane {pane_target} ({}) ===\n", line));
-                output.push_str(&capture_pane(pane_target, scroll_back).await);
-                output.push('\n');
+        let mut output = String::new();
+        for line in panes.lines() {
+            let pane_target = line.split('\t').next().unwrap_or("");
+            if pane_target.is_empty() {
+                continue;
             }
-            output
+
+            output.push_str(&format!("=== Pane {pane_target} ({}) ===\n", line));
+            output.push_str(&capture_pane(pane_target, scroll_back).await);
+            output.push('\n');
         }
+        output
     }
 }
 
@@ -584,7 +616,7 @@ impl ServerHandler for TmuxMcp {
             instructions: Some(
                 "MCP server for interacting with tmux sessions, windows, and panes. \
                  Use list_sessions to discover sessions, list_windows to see windows, \
-                 and get_pane_contents to read terminal output including scrollback history."
+                 get_pane_contents to read a specific pane, and get_window_contents to read all panes in a window."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
