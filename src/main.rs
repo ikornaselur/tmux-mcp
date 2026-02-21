@@ -124,7 +124,7 @@ struct GetPaneContentsRequest {
     target: String,
 
     #[schemars(
-        description = "Number of lines of scrollback history to include. 0 means visible area only. Defaults to 1000."
+        description = "Number of lines of scrollback history to include. 0 means visible area only. Defaults to 0 (visible area only)."
     )]
     scroll_back_lines: Option<u32>,
 }
@@ -137,7 +137,7 @@ struct GetWindowContentsRequest {
     target: Option<String>,
 
     #[schemars(
-        description = "Number of lines of scrollback history to include. 0 means visible area only. Defaults to 1000."
+        description = "Number of lines of scrollback history to include. 0 means visible area only. Defaults to 0 (visible area only)."
     )]
     scroll_back_lines: Option<u32>,
 }
@@ -522,7 +522,7 @@ impl TmuxMcp {
         &self,
         Parameters(req): Parameters<GetPaneContentsRequest>,
     ) -> String {
-        let scroll_back = req.scroll_back_lines.unwrap_or(1000);
+        let scroll_back = req.scroll_back_lines.unwrap_or(0);
         let t = req.target.trim().to_string();
 
         // Resolve target to session:window.pane format.
@@ -562,7 +562,7 @@ impl TmuxMcp {
         &self,
         Parameters(req): Parameters<GetWindowContentsRequest>,
     ) -> String {
-        let scroll_back = req.scroll_back_lines.unwrap_or(1000);
+        let scroll_back = req.scroll_back_lines.unwrap_or(0);
 
         let target = match req.target {
             Some(t) if t.contains(':') => t,
